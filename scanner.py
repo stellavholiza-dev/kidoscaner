@@ -1,416 +1,635 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AlgoWave Scanner Pro - Multi-Asset Mean Reversion Engine
-Platform: Pydroid 3 (Android Mobile Terminal)
-Strategy: One-Shot Band Break Reversal (EMA 250 + Bollinger Bounds)
-Author: @BenalgoDev
+KidoCryptosignal Scanner Pro v2 — Pydroid 3
+Combined EMA250 one-shot mean reversion + 5m momentum scalp / 15m trend.
+Public market data only; Telegram alerts only; NEVER places orders.
+
+Install: pip install requests
+
+Required environment variable:
+  TELEGRAM_BOT_TOKEN=TOKEN = ""
+
+Optional:
+  TELEGRAM_CHAT_ID=kidocryptosignal
+  ACCOUNT_EQUITY_USDT=1000
+  TOP_N=40
+  SCAN_ALL_PERPETUALS=0
+  CHECK_INTERVAL=300
+  FUTURES_BASE_URL=https://fapi.binance.com
+
+Default data adapter is Binance USD-M Futures public REST. HUMAUSDT is monitored
+if listed there. For another exchange, adapt the REST functions (exchangeInfo,
+24hr ticker, klines); do not assume symbols or contract specs are identical.
 """
 
-import os
-import sys
-import time
-import math
-import datetime
+import os, sys, json, time, math, html, traceback, datetime
+from decimal import Decimal, ROUND_DOWN
 import requests
-import traceback
 
-# ==================== CONFIGURATION ====================
-# Safe configuration: Reads token from environment variable
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = "@vipsignalhup"
+# ---------------- CONFIG ----------------
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@kidocryptosignal").strip()
+BASE = os.getenv("FUTURES_BASE_URL", "https://fapi.binance.com").rstrip("/")
+EQUITY = float(os.getenv("ACCOUNT_EQUITY_USDT", "1000"))
+RISK_PCT, MAX_LEVERAGE = 1.0, 10.0
+TOP_N = int(os.getenv("TOP_N", "40"))
+SCAN_ALL = os.getenv("SCAN_ALL_PERPETUALS", "0") == "1"
+INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
+DELAY = float(os.getenv("REQUEST_DELAY", "0.06"))
+HUMA = "HUMAUSDT"
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "algowave_state.json")
 
-# Quantitative Model Parameters
-LENGTH = 250                  # EMA 250 Trend Baseline
-STD_DEV = 1.0                 # Bollinger Deviation Multiplier
-TOLERANCE_PCT = 1.8           # Buy Zone Threshold above Green Band (%)
-MAX_BELOW_BAND_PCT = 2.0      # Max penetration under Green Band (%)
-MIN_PROFIT_PCT = 3.0          # Minimum Target Profit to EMA 250 (%)
+# Original AlgoWave mean-reversion parameters
+MR_LEN, MR_DEV = 250, 1.0
+MR_TOL, MR_MAX_BELOW, MR_MIN_PROFIT = 1.8, 2.0, 3.0
+MR_LOOKBACK = 50
+MR_TFS = ["15m", "1h", "4h", "1d"]
 
-# Speed and Intervals
-CHECK_INTERVAL = 300          # 5 minutes sleep between full cycles
-SCAN_DELAY = 0.01             # Fast loop delay for fluid terminal action
-TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+# Momentum scalp parameters
+ATR_MULT, RR = 1.5, 2.0
+VOL_MULT = 1.2
+session = requests.Session()
+session.headers.update({"User-Agent": "AlgoWaveScannerPro/2.0"})
+meta = {}
+state = {"mr": {}, "last": {}, "pending": []}
 
-# If True, triggers a verified visual alert during recording if market is quiet
-DEMO_BURST_MODE = False
 
-BINANCE_ENDPOINTS = [
-    "https://data-api.binance.vision/api/v3/klines",
-    "https://api.binance.com/api/v3/klines",
-]
-
-symbol_states = {}
-pending_signals = []
-
-# ==================== LOGGING & DIAGNOSTICS ====================
 def log(msg):
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    print("[{}] {}".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg), flush=True)
 
-def test_connectivity():
-    print("\n" + "=" * 55, flush=True)
-    log("📡 [SYSTEM] INITIALIZING HIGH-SPEED MARKET SCANNER...")
 
-    if not TELEGRAM_BOT_TOKEN:
-        log("❌ TELEGRAM_BOT_TOKEN is not set.")
-        log("💡 Please export TELEGRAM_BOT_TOKEN in your environment before running:")
-        log("   export TELEGRAM_BOT_TOKEN=\"your_bot_token_here\"")
-        print("=" * 55 + "\n", flush=True)
-        sys.exit(1)
-
-    binance_ok = False
-    for ep in ["https://data-api.binance.vision/api/v3/ping", "https://api.binance.com/api/v3/ping"]:
-        try:
-            r = requests.get(ep, timeout=3)
-            if r.status_code == 200:
-                binance_ok = True
-                log(f"⚡ Market Feed: ONLINE ({ep.split('/')[2]})")
-                break
-        except Exception:
-            continue
-
-    if not binance_ok:
-        log("❌ Market Data Feed: OFFLINE / TIMEOUT")
-
-    telegram_ok = False
+def save_state():
+    state["pending"] = state["pending"][-500:]
+    tmp = STATE_FILE + ".tmp"
     try:
-        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe", timeout=4)
-        if r.status_code == 200:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        log("State save warning: {}".format(e))
+
+
+def load_state():
+    global state
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            old = json.load(f)
+        state.update({k: old.get(k, state[k]) for k in state})
+        log("Loaded state: {} MR cycles, {} dedup keys, {} queued alerts".format(
+            len(state["mr"]), len(state["last"]), len(state["pending"])))
+    except FileNotFoundError:
+        log("Creating new persistent state file.")
+    except Exception as e:
+        log("State file unreadable; starting fresh: {}".format(e))
+
+
+def api(path, params=None, attempts=5):
+    url = BASE + path
+    last = None
+    for n in range(attempts):
+        try:
+            r = session.get(url, params=params, timeout=12)
+            if r.status_code in (418, 429):
+                wait = max(float(r.headers.get("Retry-After", 2)), min(60, 2 ** n))
+                log("Exchange rate limit {}. Wait {}s".format(r.status_code, wait))
+                time.sleep(wait)
+                continue
+            if r.status_code >= 500:
+                time.sleep(min(30, 2 ** n))
+                continue
+            r.raise_for_status()
+            return r.json()
+        except (requests.RequestException, ValueError) as e:
+            last = e
+            time.sleep(min(20, 1.5 * (2 ** n)))
+    raise RuntimeError("API failed: {}".format(last))
+
+
+def telegram_send(message):
+    url = "https://api.telegram.org/bot{}/sendMessage".format(TOKEN)
+    for n in range(4):
+        try:
+            r = session.post(url, data={
+                "chat_id": CHAT_ID, "text": message, "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            }, timeout=15)
             data = r.json()
-            if data.get("ok"):
-                bot_user = data.get("result", {}).get("username", "Bot")
-                telegram_ok = True
-                log(f"🤖 Telegram Bridge: CONNECTED (@{bot_user})")
-            else:
-                log("⚠️ Telegram API: AUTH ERROR (Invalid Token)")
-        else:
-            log(f"⚠️ Telegram API: HTTP {r.status_code}")
-    except Exception:
-        log("⚠️ Telegram API: BLOCKED (Check VPN)")
-
-    print("=" * 55 + "\n", flush=True)
-    return binance_ok, telegram_ok
-
-def format_price(val):
-    if val is None:
-        return "0.00"
-    if val < 0.0001:
-        return f"{val:.8f}"
-    elif val < 1:
-        return f"{val:.4f}"
-    else:
-        return f"{val:.2f}"
-
-# ==================== TELEGRAM DISPATCH ====================
-def get_chart_image(symbol, tf):
-    tf_map = {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}
-    interval_code = tf_map.get(tf, "240")
-    chart_url = (
-        f"https://image.thum.io/get/width/1000/crop/680/noanimate/"
-        f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}&interval={interval_code}"
-    )
-    try:
-        r = requests.get(chart_url, timeout=7)
-        if r.status_code == 200 and r.content and len(r.content) > 5000:
-            return r.content
-    except Exception:
-        pass
-    return None
-
-def send_telegram_signal(caption, symbol, tf):
-    photo = get_chart_image(symbol, tf)
-    if photo:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-            files = {'photo': (f'{symbol}_{tf}.png', photo, 'image/png')}
-            payload = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}
-            r = requests.post(url, data=payload, files=files, timeout=12)
-            if r.status_code == 200 and r.json().get("ok"):
-                log(f"🚀 Telegram Dispatch: [CHART + SIGNAL] #{symbol} [{tf}] Sent!")
+            if r.ok and data.get("ok"):
+                log("Telegram signal posted to {}".format(CHAT_ID))
                 return True
-        except Exception:
-            pass
-
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': caption,
-            'parse_mode': 'HTML',
-            'disable_web_page_preview': False
-        }
-        r = requests.post(url, data=payload, timeout=8)
-        if r.status_code == 200 and r.json().get("ok"):
-            log(f"⚡ Telegram Dispatch: [DIRECT TEXT ALERT] #{symbol} [{tf}] Sent!")
-            return True
-    except Exception:
-        pass
-
-    pending_signals.append({"caption": caption, "symbol": symbol, "tf": tf})
-    log(f"📥 Signal #{symbol} saved in retry queue ({len(pending_signals)} items).")
+            if r.status_code == 429:
+                time.sleep(float(data.get("parameters", {}).get("retry_after", 5)) + 1)
+                continue
+            log("Telegram rejected alert: {}".format(data.get("description", r.text[:200])))
+            return False
+        except Exception as e:
+            log("Telegram send error: {}".format(e))
+            time.sleep(2 ** n)
     return False
 
-def flush_pending():
-    if not pending_signals:
-        return
-    log(f"🔄 Retrying {len(pending_signals)} queued signals...")
+
+def dispatch(message):
+    if not telegram_send(message):
+        state["pending"].append({"message": message, "queued": datetime.datetime.now().isoformat()})
+        state["pending"] = state["pending"][-500:]
+        save_state()
+
+
+def flush_queue():
     sent = 0
-    while pending_signals and sent < 3:
-        item = pending_signals.pop(0)
-        if send_telegram_signal(item["caption"], item["symbol"], item["tf"]):
+    while state["pending"] and sent < 5:
+        item = state["pending"][0]
+        if telegram_send(item.get("message", "")):
+            state["pending"].pop(0)
             sent += 1
-            time.sleep(0.5)
+            save_state()
         else:
-            pending_signals.insert(0, item)
             break
 
-# ==================== DATA & CALCULATIONS ====================
-def get_all_pairs():
-    # 1. Fetch dynamically from Nobitex market stats (all USDT pairs)
+
+def test_setup():
+    global TOKEN
+
+    if not TOKEN:
+        print("\nTELEGRAM BOT SETUP")
+        TOKEN = input("Paste your Telegram Bot Token: ").strip()
+
+    if not TOKEN:
+        raise RuntimeError("No Telegram token entered.")
+
     try:
-        r = requests.get("https://apiv2.nobitex.ir/market/stats", timeout=5)
-        if r.status_code == 200:
-            stats = r.json().get('stats', {})
-            pairs = [k.replace("-usdt", "").upper() + "USDT" for k in stats.keys() if k.endswith("-usdt")]
-            if len(pairs) > 15:
-                return sorted(list(set(pairs)))
-    except Exception:
-        pass
+        api("/fapi/v1/ping", attempts=2)
+        log("Binance market data endpoint online.")
+    except Exception as e:
+        log("Market endpoint warning: {}".format(e))
 
-    # 2. Comprehensive Fallback Market List
-    return [
-        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT",
-        "AVAXUSDT", "LINKUSDT", "DOTUSDT", "NEARUSDT", "LTCUSDT", "UNIUSDT", "ATOMUSDT",
-        "APTUSDT", "FILUSDT", "ICPUSDT", "ARBUSDT", "OPUSDT", "FTMUSDT", "SUIUSDT",
-        "TAOUSDT", "FETUSDT", "RENDERUSDT", "RAYUSDT", "LITUSDT", "ATUSDT", "GALAUSDT",
-        "SANDUSDT", "MANAUSDT", "AXSUSDT", "PEPEUSDT", "ENAUSDT", "WLDUSDT", "COTIUSDT"
+    try:
+        r = session.get(
+            "https://api.telegram.org/bot{}/getMe".format(TOKEN),
+            timeout=15
+        )
+        data = r.json()
+
+        if not r.ok or not data.get("ok"):
+            raise RuntimeError(
+                "Telegram token error: {}".format(
+                    data.get("description", "Unknown error")
+                )
+            )
+
+        log("Telegram connected successfully!")
+        log("Bot username: @{}".format(
+            data["result"].get("username", "unknown")
+        ))
+
+    except requests.RequestException as e:
+        raise RuntimeError("Telegram connection failed: {}".format(e))
+
+
+def load_universe():
+    global meta
+    info = api("/fapi/v1/exchangeInfo")
+    found = {}
+    for s in info.get("symbols", []):
+        if (s.get("status") == "TRADING" and s.get("contractType") == "PERPETUAL"
+                and s.get("quoteAsset") == "USDT"):
+            lot = next((f for f in s.get("filters", []) if f.get("filterType") == "LOT_SIZE"), {})
+            found[s["symbol"]] = {
+                "step": float(lot.get("stepSize", 0) or 0),
+                "min": float(lot.get("minQty", 0) or 0)
+            }
+    meta = found
+    log("Found {} tradable USDT perpetual contracts.".format(len(meta)))
+    return set(meta)
+
+
+def choose_symbols(available):
+    if SCAN_ALL:
+        selected = sorted(available)
+    else:
+        tickers = api("/fapi/v1/ticker/24hr")
+        ranked = sorted(
+            [(x["symbol"], float(x.get("quoteVolume", 0))) for x in tickers
+             if x.get("symbol") in available],
+            key=lambda x: x[1], reverse=True
+        )
+        selected = [x[0] for x in ranked[:TOP_N]]
+    if HUMA in available and HUMA not in selected:
+        selected.append(HUMA)
+    if HUMA not in available:
+        log("NOTICE: HUMAUSDT is not listed on this futures endpoint; dedicated HUMA scan skipped.")
+    return selected
+
+
+def candles(symbol, tf, limit=320):
+    raw = api("/fapi/v1/klines", {"symbol": symbol, "interval": tf, "limit": limit}, attempts=3)
+    now = int(time.time() * 1000)
+    out = []
+    for x in raw:
+        if len(x) >= 7 and int(x[6]) < now:
+            out.append({
+                "ot": int(x[0]), "ct": int(x[6]), "o": float(x[1]),
+                "h": float(x[2]), "l": float(x[3]), "c": float(x[4]), "v": float(x[5])
+            })
+    return out
+
+
+# ---------------- INDICATORS (stdlib only) ----------------
+def ema(values, length):
+    out = [None] * len(values)
+    if len(values) < length:
+        return out
+    out[length - 1] = sum(values[:length]) / length
+    a = 2.0 / (length + 1.0)
+    for i in range(length, len(values)):
+        out[i] = a * values[i] + (1 - a) * out[i - 1]
+    return out
+
+
+def rsi(values, length=14):
+    out = [None] * len(values)
+    if len(values) <= length:
+        return out
+    gains, losses = [], []
+    for i in range(1, length + 1):
+        d = values[i] - values[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    ag, al = sum(gains) / length, sum(losses) / length
+
+    def value(g, l):
+        if l == 0:
+            return 100.0 if g > 0 else 50.0
+        return 100 - 100 / (1 + g / l)
+
+    out[length] = value(ag, al)
+    for i in range(length + 1, len(values)):
+        d = values[i] - values[i - 1]
+        ag = (ag * (length - 1) + max(d, 0)) / length
+        al = (al * (length - 1) + max(-d, 0)) / length
+        out[i] = value(ag, al)
+    return out
+
+
+def macd(values):
+    ef, es = ema(values, 12), ema(values, 26)
+    line = [None] * len(values)
+    for i in range(len(values)):
+        if ef[i] is not None and es[i] is not None:
+            line[i] = ef[i] - es[i]
+    start = next((i for i, x in enumerate(line) if x is not None), None)
+    sig, hist = [None] * len(values), [None] * len(values)
+    if start is not None:
+        valid = [x for x in line[start:] if x is not None]
+        sig_valid = ema(valid, 9)
+        for j, x in enumerate(sig_valid):
+            i = start + j
+            sig[i] = x
+            if x is not None:
+                hist[i] = line[i] - x
+    return line, sig, hist
+
+
+def atr(cs, length=14):
+    tr = []
+    for i, c in enumerate(cs):
+        if i == 0:
+            tr.append(c["h"] - c["l"])
+        else:
+            pc = cs[i - 1]["c"]
+            tr.append(max(c["h"] - c["l"], abs(c["h"] - pc), abs(c["l"] - pc)))
+    out = [None] * len(cs)
+    if len(tr) >= length:
+        cur = sum(tr[:length]) / length
+        out[length - 1] = cur
+        for i in range(length, len(tr)):
+            cur = (cur * (length - 1) + tr[i]) / length
+            out[i] = cur
+    return out
+
+
+def sma(values, length):
+    return sum(values[-length:]) / length if len(values) >= length else None
+
+
+def quantity_for(symbol, entry, stop):
+    dist = abs(entry - stop)
+    if entry <= 0 or dist <= 0 or EQUITY <= 0:
+        return 0, 0, 0
+    risk_cash = EQUITY * RISK_PCT / 100
+    qty = min(risk_cash / dist, (EQUITY * MAX_LEVERAGE) / entry)
+    step = meta.get(symbol, {}).get("step", 0)
+    minimum = meta.get(symbol, {}).get("min", 0)
+    if step > 0:
+        q, st = Decimal(str(qty)), Decimal(str(step))
+        qty = float((q / st).to_integral_value(rounding=ROUND_DOWN) * st)
+    if minimum and qty < minimum:
+        qty = 0
+    return qty, qty * entry, risk_cash
+
+
+def price(x):
+    if abs(x) < 0.0001:
+        return "{:.8f}".format(x)
+    if abs(x) < 1:
+        return "{:.6f}".format(x)
+    return "{:.4f}".format(x)
+
+
+def make_message(s):
+    sym = html.escape(s["symbol"])
+    lines = [
+        "🚨 <b>ALGOWAVE SCANNER PRO</b> 🚨",
+        "━━━━━━━━━━━━━━━━━━",
+        "{} <b>{} | {}</b>".format("🟢" if s["side"] == "BUY" else "🔴", s["side"], sym),
+        "🧠 <b>Strategy:</b> <code>{}</code>".format(html.escape(s["engine"])),
+        "⏱ <b>Entry TF:</b> <code>{}</code> | <b>Trend TF:</b> <code>{}</code>".format(
+            s["tf"], s.get("trend_tf", "N/A")),
+        "━━━━━━━━━━━━━━━━━━",
+        "💲 Entry: <code>{}</code>".format(price(s["entry"])),
+        "🛑 Stop: <code>{}</code>".format(price(s["stop"])),
+        "🎯 Target: <code>{}</code>".format(price(s["target"])),
+        "⚖️ R:R: <code>1:{:.2f}</code>".format(s["rr"]),
+        "📊 Confirmation: <code>{}/{}</code>".format(s["score"], s["max_score"]),
     ]
+    lines += ["• " + html.escape(x) for x in s["notes"]]
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        "Equity basis: <code>{:.2f} USDT</code>".format(EQUITY),
+        "Risk budget: <code>{:.2f} USDT ({}%)</code>".format(s["risk_cash"], RISK_PCT),
+        "Estimated qty: <code>{:.6f}</code>".format(s["qty"]),
+        "Estimated notional: <code>{:.2f} USDT</code>".format(s["notional"]),
+        "Max notional leverage: <code>{:.1f}x</code>".format(MAX_LEVERAGE),
+        "🕯 Closed candle: <code>{}</code>".format(
+            datetime.datetime.fromtimestamp(s["ct"] / 1000, datetime.timezone.utc)
+            .strftime("%Y-%m-%d %H:%M UTC")),
+        "🔗 <a href='https://www.tradingview.com/chart/?symbol=BINANCE:{}'>TradingView chart</a>".format(sym),
+        "⚠️ <i>Alert only. No orders placed. Verify contract specs, fees, slippage and margin before trading.</i>"
+    ]
+    return "\n".join(lines)
 
-def get_klines(symbol, interval):
-    for base in BINANCE_ENDPOINTS:
-        url = f"{base}?symbol={symbol}&interval={interval}&limit=320"
-        try:
-            r = requests.get(url, timeout=3.5)
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list) and len(data) >= LENGTH + 15:
-                    highs = [float(c[2]) for c in data]
-                    lows = [float(c[3]) for c in data]
-                    closes = [float(c[4]) for c in data]
-                    return closes, highs, lows
-        except Exception:
+
+def emit(s):
+    key = "{}|{}|{}".format(s["symbol"], s["engine"], s["tf"])
+    candle_id = str(s["ct"])
+    if state["last"].get(key) == candle_id:
+        return False
+    # Persist deduplication before network send to avoid duplicate after restart.
+    state["last"][key] = candle_id
+    save_state()
+    msg = make_message(s)
+    if not telegram_send(msg):
+        state["pending"].append({"message": msg, "queued": datetime.datetime.now().isoformat()})
+        state["pending"] = state["pending"][-500:]
+        save_state()
+    log("{} {} {} @ {}".format(s["side"], s["symbol"], s["engine"], price(s["entry"])))
+    return True
+
+
+# ---------------- ORIGINAL EMA250 ONE-SHOT MEAN REVERSION ----------------
+def mean_reversion(symbol, tf, cs):
+    if len(cs) < MR_LEN + 15:
+        return None
+    closes = [x["c"] for x in cs]
+    highs = [x["h"] for x in cs]
+    lows = [x["l"] for x in cs]
+    e = ema(closes, MR_LEN)
+    upper, lower = [None] * len(cs), [None] * len(cs)
+    start = max(MR_LEN - 1, len(cs) - MR_LOOKBACK - 2)
+    for i in range(start, len(cs)):
+        if e[i] is None:
             continue
-    return None, None, None
+        w = closes[i - MR_LEN + 1:i + 1]
+        avg = sum(w) / MR_LEN
+        dev = math.sqrt(sum((v - avg) ** 2 for v in w) / MR_LEN) * MR_DEV
+        upper[i], lower[i] = e[i] + dev, e[i] - dev
 
-def calculate_ema_series(prices, span):
-    alpha = 2.0 / (span + 1.0)
-    ema = [None] * len(prices)
-    seed = sum(prices[:span]) / span
-    ema[span - 1] = seed
-    for i in range(span, len(prices)):
-        ema[i] = alpha * prices[i] + (1.0 - alpha) * ema[i - 1]
-    return ema
-
-# ==================== STRATEGY ENGINE ====================
-def analyze_sequence_and_signal(symbol, tf, step_count=0):
-    closes, highs, lows = get_klines(symbol, tf)
-    if not closes or len(closes) < LENGTH + 15:
+    i = len(cs) - 1
+    if upper[i] is None or lower[i] is None:
         return None
+    key = symbol + "|" + tf
+    phase = state["mr"].get(key, "idle")
+    cur = cs[i]
 
-    c = closes[:-1]
-    h = highs[:-1]
-    l = lows[:-1]
-    n = len(c)
-
-    ema_series = calculate_ema_series(c, LENGTH)
-    lookback = min(50, n - LENGTH)
-    upper_bands = [None] * n
-    lower_bands = [None] * n
-
-    for i in range(n - lookback, n):
-        window = c[i - LENGTH + 1 : i + 1]
-        mean_val = sum(window) / LENGTH
-        variance = sum((x - mean_val) ** 2 for x in window) / LENGTH
-        dev = math.sqrt(variance) * STD_DEV
-        upper_bands[i] = ema_series[i] + dev
-        lower_bands[i] = ema_series[i] - dev
-
-    cur_close = c[-1]
-    cur_low = l[-1]
-    cur_high = h[-1]
-    cur_ema = ema_series[-1]
-    cur_upper = upper_bands[-1]
-    cur_lower = lower_bands[-1]
-
-    if cur_ema is None or cur_upper is None or cur_lower is None or cur_lower <= 0:
-        return None
-
-    state_key = (symbol, tf)
-    current_state = symbol_states.get(state_key, "idle")
-
-    # Cycle Reset on Upper Band Cross
-    if cur_high >= cur_upper:
-        symbol_states[state_key] = "above_red"
-        return None
-
-    # Consumed when EMA 250 (Blue Line) Target is reached
-    if current_state == "signalled":
-        if cur_high >= cur_ema:
-            symbol_states[state_key] = "consumed"
-            log(f"  [{tf}] #{symbol} Hit TP (Blue Line EMA 250) -> Cycle Finished.")
-        return None
-
-    if current_state == "consumed":
-        return None
-
-    # Check Sequence: High > Red -> Drop Below Blue
-    if current_state in ("idle", "above_red"):
-        saw_above_red = False
-        saw_below_blue = False
-        
-        scan_start = n - lookback
-        for i in range(scan_start, n):
-            if upper_bands[i] is None:
-                continue
-            if not saw_above_red:
-                if h[i] >= upper_bands[i]:
-                    saw_above_red = True
-            else:
-                if c[i] < ema_series[i]:
-                    saw_below_blue = True
-                    break
-
-        if saw_above_red and saw_below_blue:
-            current_state = "below_blue"
-            symbol_states[state_key] = "below_blue"
-
-    # Entry Trigger Conditions
-    if current_state == "below_blue":
-        if cur_close >= cur_ema:
-            symbol_states[state_key] = "idle"
+    if phase == "signalled":
+        if cur["h"] >= e[i]:
+            state["mr"][key] = "consumed"
+            save_state()
+        else:
             return None
 
-        min_allowed_price = cur_lower * (1.0 - MAX_BELOW_BAND_PCT / 100.0)
-        max_allowed_price = cur_lower * (1.0 + TOLERANCE_PCT / 100.0)
+    phase = state["mr"].get(key, phase)
+    if phase == "consumed":
+        if cur["h"] >= upper[i]:
+            phase = "above_red"
+        else:
+            state["mr"][key] = phase
+            return None
 
-        price_in_buy_zone = (cur_low <= max_allowed_price) and (cur_close >= min_allowed_price)
-        profit_pct = ((cur_ema - cur_close) / cur_close) * 100.0
+    saw_upper = phase == "above_red"
+    saw_below = phase == "below_blue"
+    for j in range(start, i + 1):
+        if upper[j] is None:
+            continue
+        if not saw_upper and highs[j] >= upper[j]:
+            saw_upper = True
+        elif saw_upper and closes[j] < e[j]:
+            saw_below = True
 
-        trigger_fire = (price_in_buy_zone and profit_pct >= MIN_PROFIT_PCT)
+    phase = "below_blue" if saw_below else ("above_red" if saw_upper else "idle")
+    if phase == "below_blue" and cur["c"] >= e[i]:
+        phase = "idle"
+    state["mr"][key] = phase
 
-        # Safety Demo trigger during video recording if enabled
-        if DEMO_BURST_MODE and step_count == 12:
-            trigger_fire = True
-            profit_pct = max(3.45, profit_pct)
+    if phase != "below_blue":
+        return None
 
-        if trigger_fire:
-            symbol_states[state_key] = "signalled"
+    min_price = lower[i] * (1 - MR_MAX_BELOW / 100)
+    max_price = lower[i] * (1 + MR_TOL / 100)
+    in_zone = lows[i] <= max_price and cur["c"] >= min_price and cur["c"] <= max_price
+    profit_pct = (e[i] - cur["c"]) / cur["c"] * 100
+    if not in_zone or profit_pct < MR_MIN_PROFIT:
+        return None
 
-            entry = cur_close
-            target = cur_ema if cur_ema > entry else entry * 1.042
-            stop_loss = cur_lower * 0.985
-            loss_pct = ((entry - stop_loss) / entry) * 100.0
-            rr = (profit_pct / loss_pct) if loss_pct > 0 else 1.5
+    entry, stop, target = cur["c"], lower[i] * 0.985, e[i]
+    if not stop < entry < target:
+        return None
+    qty, notional, risk_cash = quantity_for(symbol, entry, stop)
+    if qty <= 0:
+        return None
 
-            if cur_low <= cur_lower:
-                status_desc = "Price pierced Lower Green Band"
-            else:
-                status_desc = "Price testing Green Band Entry Zone"
+    rv = rsi(closes)
+    ml, ms, mh = macd(closes)
+    vavg = sma([x["v"] for x in cs], 20)
+    score, notes = 0, [
+        "Original sequence: upper band touch then close below EMA250",
+        "Price inside original lower-band buy zone",
+        "Potential return to EMA250: {:.2f}%".format(profit_pct)
+    ]
+    if rv[i] is not None and rv[i] > 30:
+        score += 1
+        notes.append("RSI14 above 30")
+    if mh[i] is not None and mh[i - 1] is not None and mh[i] > mh[i - 1]:
+        score += 1
+        notes.append("MACD histogram improving")
+    if vavg and cur["v"] > vavg:
+        score += 1
+        notes.append("Volume above SMA20")
+    risk = entry - stop
+    state["mr"][key] = "signalled"
+    save_state()
+    return {
+        "symbol": symbol, "engine": "EMA250 ONE-SHOT MEAN REVERSION",
+        "side": "BUY", "tf": tf, "trend_tf": "EMA250 baseline",
+        "entry": entry, "stop": stop, "target": target,
+        "rr": (target - entry) / risk, "qty": qty, "notional": notional,
+        "risk_cash": risk_cash, "score": score, "max_score": 3,
+        "notes": notes, "ct": cur["ct"]
+    }
 
-            return {
-                "symbol": symbol,
-                "tf": tf,
-                "entry": entry,
-                "target": target,
-                "stop_loss": stop_loss,
-                "profit_pct": profit_pct,
-                "loss_pct": loss_pct,
-                "rr": rr,
-                "basis": cur_ema,
-                "lower_band": cur_lower,
-                "upper_band": cur_upper,
-                "desc": status_desc
-            }
 
-    return None
+# ---------------- 5m MOMENTUM SCALP / 15m TREND ----------------
+def scalp(symbol, c5, c15):
+    if len(c5) < 80 or len(c15) < 80:
+        return None
+    x = [c["c"] for c in c5]
+    y = [c["c"] for c in c15]
+    e9, e21 = ema(x, 9), ema(x, 21)
+    rv = rsi(x)
+    ml, ms, mh = macd(x)
+    av = atr(c5, 14)
+    vol = [c["v"] for c in c5]
+    vavg = [None] * len(vol)
+    for k in range(19, len(vol)):
+        vavg[k] = sum(vol[k - 19:k + 1]) / 20
+    t20, t50 = ema(y, 20), ema(y, 50)
+    i, p, j = len(c5) - 1, len(c5) - 2, len(c15) - 1
+    vals = [e9[i], e21[i], e9[p], e21[p], rv[i], ml[i], ms[i],
+            mh[i], mh[p], av[i], vavg[i], t20[j], t50[j]]
+    if any(v is None for v in vals):
+        return None
 
-# ==================== MAIN SCANNER ENGINE ====================
-def run_scanner():
-    test_connectivity()
+    long_checks = [
+        y[j] > t20[j] > t50[j],
+        e9[i] > e21[i],
+        50 < rv[i] < 70,
+        ml[i] > ms[i] and mh[i] > 0,
+        c5[i]["v"] > vavg[i] * VOL_MULT,
+        x[p] <= e9[p] and x[i] > e9[i]
+    ]
+    short_checks = [
+        y[j] < t20[j] < t50[j],
+        e9[i] < e21[i],
+        30 < rv[i] < 50,
+        ml[i] < ms[i] and mh[i] < 0,
+        c5[i]["v"] > vavg[i] * VOL_MULT,
+        x[p] >= e9[p] and x[i] < e9[i]
+    ]
+    if all(long_checks):
+        side, score = "BUY", sum(long_checks)
+    elif all(short_checks):
+        side, score = "SELL", sum(short_checks)
+    else:
+        return None
 
-    pairs = get_all_pairs()
-    log(f"Ready: Monitoring {len(pairs)} Total Market Assets across {TIMEFRAMES}")
+    entry, distance = c5[i]["c"], av[i] * ATR_MULT
+    if side == "BUY":
+        stop, target = entry - distance, entry + distance * RR
+    else:
+        stop, target = entry + distance, entry - distance * RR
+    qty, notional, risk_cash = quantity_for(symbol, entry, stop)
+    if qty <= 0:
+        return None
 
-    tf_tv_map = {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+    notes = [
+        "15m EMA20/EMA50 trend aligned",
+        "5m EMA9/EMA21 aligned",
+        "RSI14: {:.1f}".format(rv[i]),
+        "MACD 12/26/9 confirmed",
+        "Volume: {:.2f}x SMA20".format(c5[i]["v"] / vavg[i]),
+        "ATR14: {}".format(price(av[i]))
+    ]
+    return {
+        "symbol": symbol, "engine": "EMA MOMENTUM SCALP",
+        "side": side, "tf": "5m", "trend_tf": "15m",
+        "entry": entry, "stop": stop, "target": target, "rr": RR,
+        "qty": qty, "notional": notional, "risk_cash": risk_cash,
+        "score": score, "max_score": 6, "notes": notes, "ct": c5[i]["ct"]
+    }
+
+
+def scan_symbol(symbol):
+    count = 0
+    try:
+        c5 = candles(symbol, "5m")
+        time.sleep(DELAY)
+        c15 = candles(symbol, "15m")
+        time.sleep(DELAY)
+        sig = scalp(symbol, c5, c15)
+        if sig and emit(sig):
+            count += 1
+    except Exception as e:
+        log("{} scalp scan error: {}".format(symbol, e))
+
+    for tf in MR_TFS:
+        try:
+            cs = c15 if tf == "15m" else candles(symbol, tf)
+            if tf != "15m":
+                time.sleep(DELAY)
+            sig = mean_reversion(symbol, tf, cs)
+            if sig and emit(sig):
+                count += 1
+        except Exception as e:
+            log("{} {} MR scan error: {}".format(symbol, tf, e))
+    return count
+
+
+def run():
+    load_state()
+    test_setup()
+    available = load_universe()
+    if not available:
+        raise RuntimeError("No eligible USDT perpetual contracts returned by exchange.")
+    symbols = choose_symbols(available)
+    log("Monitoring {} symbols. HUMAUSDT: {}.".format(
+        len(symbols), "ON" if HUMA in symbols else "NOT LISTED"))
+    log("Scalp: 5m entry / 15m trend. MR timeframes: {}".format(", ".join(MR_TFS)))
+    log("Risk: {}% equity, max {}x notional; scalp SL {} ATR, TP {}R.".format(
+        RISK_PCT, MAX_LEVERAGE, ATR_MULT, RR))
+
     cycle = 0
-
     while True:
         cycle += 1
-        cycle_start = time.time()
-        flush_pending()
-
-        total_checks = len(pairs) * len(TIMEFRAMES)
-        current = 0
+        started = time.time()
         found = 0
+        log("=" * 55 + " SCAN CYCLE {}".format(cycle))
+        flush_queue()
+        symbols = choose_symbols(available)
+        for n, symbol in enumerate(symbols, 1):
+            log("[{}/{}] {}".format(n, len(symbols), symbol))
+            found += scan_symbol(symbol)
+        save_state()
+        elapsed = time.time() - started
+        log("Cycle {} complete: {} new alerts, {:.1f}s.".format(cycle, found, elapsed))
+        time.sleep(max(5, INTERVAL - elapsed))
 
-        log(f"🔄 Starting Full Sweep #{cycle} (Total checks: {total_checks})...")
-
-        for s in pairs:
-            for tf in TIMEFRAMES:
-                current += 1
-                log(f"🔍 [{current:03d}/{total_checks:03d}] Scanning {s:<10} [{tf:<3}] | Hits: {found}")
-
-                res = analyze_sequence_and_signal(s, tf, step_count=current)
-                if res:
-                    found += 1
-                    print("\n" + "🔥" * 28, flush=True)
-                    log(f"🎯 [EXPLOSIVE SETUP FOUND] #{res['symbol']} on [{res['tf']}]")
-                    log(f"Entry: {format_price(res['entry'])} | Target (Blue Line): {format_price(res['target'])} (+{res['profit_pct']:.2f}%)")
-                    log(f"Green Band: {format_price(res['lower_band'])} | EMA 250: {format_price(res['basis'])}")
-                    print("🔥" * 28 + "\n", flush=True)
-
-                    tv_interval = tf_tv_map.get(res['tf'], '240')
-                    tv_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{res['symbol']}&interval={tv_interval}"
-
-                    msg = (
-                        f"🚨 <b>ALGOWAVE | STRATEGY ALERT</b> 🚨\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"💎 <b>Pair:</b> #{res['symbol']}\n"
-                        f"⏱ <b>Timeframe:</b> <code>{res['tf']}</code>\n"
-                        f"🧭 <b>Setup:</b> <code>One-Shot Mean Reversion</code>\n"
-                        f"💡 <b>Trigger:</b> {res['desc']}\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🟢 <b>Buy Zone (Green Band):</b> <code>{format_price(res['lower_band'])} USDT</code>\n"
-                        f"💲 <b>Current Entry:</b> <code>{format_price(res['entry'])} USDT</code>\n"
-                        f"🔵 <b>Target (EMA 250 / Blue):</b> <code>{format_price(res['target'])} USDT</code> (<b>+{res['profit_pct']:.2f}%</b>)\n"
-                        f"🛑 <b>Stop Loss:</b> <code>{format_price(res['stop_loss'])} USDT</code> (-{res['loss_pct']:.2f}%)\n"
-                        f"⚖️ <b>Risk / Reward:</b> <b>1 : {res['rr']:.2f}</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"⚠️ <i>Single-cycle signal: Once EMA 250 is reached, setup is consumed.</i>\n"
-                        f"📈 <a href='{tv_link}'>Open Live Chart on TradingView</a>\n\n"
-                        f"⚡ <b>Channel:</b> {TELEGRAM_CHAT_ID}\n"
-                        f"🛠 <b>Engine Developed by:</b> @BenalgoDev"
-                    )
-
-                    send_telegram_signal(msg, res['symbol'], res['tf'])
-                    time.sleep(1.0)
-
-                time.sleep(SCAN_DELAY)
-
-        elapsed = time.time() - cycle_start
-        log(f"✅ Cycle #{cycle} completed in {elapsed:.1f}s. Total signals found: {found}")
-        log(f"⏳ Sleeping {CHECK_INTERVAL // 60}m until next sweep...")
-        time.sleep(CHECK_INTERVAL)
 
 def main():
     while True:
         try:
-            run_scanner()
+            run()
+        except KeyboardInterrupt:
+            log("Stopped by user.")
+            save_state()
+            break
         except Exception as e:
-            log(f"⚠️ Engine exception caught: {e}")
-            log("🔄 Restarting runner in 5s...")
-            time.sleep(5)
+            log("Scanner error: {}".format(e))
+            traceback.print_exc()
+            save_state()
+            log("Reconnecting in 10 seconds...")
+            time.sleep(10)
+
 
 if __name__ == "__main__":
     main()
